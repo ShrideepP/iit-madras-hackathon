@@ -35,29 +35,37 @@ def get_route():
     if not start_coords or not end_coords:
         return render_template('route_optimizer.html', error="Could not geocode one or both city names.")
 
-    route, distance, estimated_time = get_route_from_osrm(start_coords, end_coords)
+    routes = get_routes_from_osrm(start_coords, end_coords)
 
-    if not route:
-        return render_template('route_optimizer.html', error="Could not find a route between the cities.")
+    if not routes:
+        return render_template('route_optimizer.html', error="Could not find routes between the cities.")
 
-    map_path = generate_map(route, start_coords, end_coords)
-    weather = get_weather_data(route)
-    emissions = get_emissions_data(distance, fuel_type, fuel_efficiency)
-    traffic_condition, traffic_speed = get_traffic_data(start_coords, end_coords)
+    map_path = generate_map(routes, start_coords, end_coords)
+    
+    route_data = []
+    for route in routes:
+        weather = get_weather_data(route['route'])
+        emissions = get_emissions_data(route['distance'], fuel_type, fuel_efficiency)
+        traffic_condition, traffic_speed = get_traffic_data(start_coords, end_coords)
+        traffic_speed = adjust_speed_based_on_load(traffic_speed, load_weight)
+        estimated_time_hours = route['distance'] / traffic_speed
+        formatted_time = convert_minutes_to_hr_min(estimated_time_hours * 60)
 
-    traffic_speed = adjust_speed_based_on_load(traffic_speed, load_weight)
-    estimated_time_hours = distance / traffic_speed
-    formatted_time = convert_minutes_to_hr_min(estimated_time_hours * 60)
+        route_data.append({
+            'distance': route['distance'],
+            'weather': weather,
+            'emissions': emissions,
+            'traffic_condition': traffic_condition,
+            'estimated_time': formatted_time
+        })
+
+    print(route_data)
 
     return render_template(
         'route_optimizer.html',
-        route=route,
-        distance=distance,
-        weather=weather,
-        emissions=emissions,
-        map_path=map_path,
-        traffic_condition=traffic_condition,
-        estimated_time=formatted_time
+        routes=routes,
+        route_data=route_data,
+        map_path=map_path
     )
 
 def adjust_speed_based_on_load(speed, load_weight):
@@ -181,33 +189,33 @@ def get_nearby_tolls(route):
         return []
 
 
-def get_route_from_osrm(start_coords, end_coords):
-    url = f'http://router.project-osrm.org/route/v1/driving/{start_coords[0]},{start_coords[1]};{end_coords[0]},{end_coords[1]}?overview=full&geometries=geojson'
+def get_routes_from_osrm(start_coords, end_coords):
+    url = f'http://router.project-osrm.org/route/v1/driving/{start_coords[0]},{start_coords[1]};{end_coords[0]},{end_coords[1]}?alternatives=true&overview=full&geometries=geojson'
     try:
         response = requests.get(url)
         response.raise_for_status()
         data = response.json()
         if data['routes']:
-            route = data['routes'][0]['geometry']['coordinates']
-            distance = round(data['routes'][0]['legs'][0]['distance'] / 1000, 2)
-            return route, distance, convert_minutes_to_hr_min((distance / 50) * 60)
+            routes = []
+            for route in data['routes']:
+                route_data = {
+                    'route': route['geometry']['coordinates'],
+                    'distance': round(route['legs'][0]['distance'] / 1000, 2),
+                    'estimated_time': convert_minutes_to_hr_min((route['legs'][0]['distance'] / 50000) * 60)  # Assuming 50 km/h
+                }
+                routes.append(route_data)
+            return sorted(routes, key=lambda x: x['distance'])
     except requests.RequestException as e:
         print(f"Error in route request: {e}")
-    return None, None, None
+    return None
 
-def generate_map(route, start_coords, end_coords):
-    """
-    Generate a map with a highlighted route, FedEx truck at the starting point,
-    and toggleable layers for fuel stations and tolls.
-    """
+def generate_map(routes, start_coords, end_coords):
     import folium
-    from folium import LayerControl  # Corrected import
+    from folium import LayerControl
 
-    # Create a map centered on the starting location with OpenStreetMap as the default theme
-    start_lat, start_lon = route[0][1], route[0][0]
+    start_lat, start_lon = routes[0]['route'][0][1], routes[0]['route'][0][0]
     map_obj = folium.Map(location=[start_lat, start_lon], zoom_start=12, tiles="OpenStreetMap")
 
-    # Add CSS for blinking effect (added more specific targeting)
     map_obj.get_root().html.add_child(folium.Element("""
         <style>
         @keyframes blink {
@@ -228,27 +236,24 @@ def generate_map(route, start_coords, end_coords):
         </style>
     """))
 
-    # Add a FedEx truck icon at the starting point (replacing the original start marker)
     truck_icon_html = """
         <div style="font-size: 25px; color: #4287f5;">
             <i class="fa-solid fa-truck" style="color: #4287f5;"></i>
         </div>
     """
-    truck_marker = folium.Marker(
-        location=[start_lat, start_lon],  # Use start coordinates
+    folium.Marker(
+        location=[start_lat, start_lon],
         popup="FedEx Truck",
         tooltip="FedEx Truck",
         icon=folium.DivIcon(html=truck_icon_html)
     ).add_to(map_obj)
 
-    # Add a blinking circle with the DivIcon approach
     folium.Marker(
         location=[start_lat, start_lon],
         icon=folium.DivIcon(html='<div class="blink-circle"></div>')
     ).add_to(map_obj)
 
-    # Add a marker for the ending point
-    end_lat, end_lon = route[-1][1], route[-1][0]
+    end_lat, end_lon = routes[0]['route'][-1][1], routes[0]['route'][-1][0]
     folium.Marker(
         location=[end_lat, end_lon],
         popup="Ending Point",
@@ -256,53 +261,51 @@ def generate_map(route, start_coords, end_coords):
         icon=folium.Icon(color="red", icon="stop")
     ).add_to(map_obj)
 
-    # Add the route to the map as a polyline
-    folium.PolyLine(
-        locations=[(lat, lon) for lon, lat in route],
-        color="blue",
-        weight=4,
-        opacity=1
-    ).add_to(map_obj)
+    colors = ["blue", "green"]
+    for idx, route in enumerate(routes):
+        folium.PolyLine(
+            locations=[(lat, lon) for lon, lat in route['route']],
+            color=colors[idx % len(colors)],
+            weight=4,
+            opacity=1,
+            tooltip=f"Route {idx + 1}: {route['distance']} km"
+        ).add_to(map_obj)
 
-    # Create feature groups for tolls and fuel stations
     toll_layer = folium.FeatureGroup(name="Tolls", show=False)
     fuel_layer = folium.FeatureGroup(name="Fuel Stations", show=False)
 
-    # Add fuel stations to the fuel layer
-    fuel_stations = get_nearby_fuel_stations(route)
-    for station in fuel_stations:
-        fuel_icon_html = """
-            <div style="font-size: 25px; color: ##00fc43;">
-                <i class="fa-solid fa-gas-pump fa-beat" style="color: #00b344;"></i>
-            </div>
-        """
-        folium.Marker(
-            location=[station['lat'], station['lon']],
-            popup=f"Fuel Station: {station['name']}",
-            tooltip="Fuel Station",
-            icon=folium.DivIcon(html=fuel_icon_html)
-        ).add_to(fuel_layer)
+    for idx, route in enumerate(routes):
+        fuel_stations = get_nearby_fuel_stations(route['route'])
+        for station in fuel_stations:
+            fuel_icon_html = """
+                <div style="font-size: 25px; color: ##00fc43;">
+                    <i class="fa-solid fa-gas-pump fa-beat" style="color: #00b344;"></i>
+                </div>
+            """
+            folium.Marker(
+                location=[station['lat'], station['lon']],
+                popup=f"Fuel Station: {station['name']}",
+                tooltip="Fuel Station",
+                icon=folium.DivIcon(html=fuel_icon_html)
+            ).add_to(fuel_layer)
 
-    # Add tolls to the toll layer
-    tolls = get_nearby_tolls(route)
-    for toll in tolls:
-        toll_icon_html = """
-            <div style="font-size: 25px; color: #ff8800;">
-                <i class="fa-solid fa-road fa-bounce" style="color: #ff8800;"></i>
-            </div>
-        """
-        folium.Marker(
-            location=[toll['lat'], toll['lon']],
-            popup=f"Toll: {toll['name']}, Fee: {toll.get('fee', 'N/A')}",
-            tooltip="Toll",
-            icon=folium.DivIcon(html=toll_icon_html)
-        ).add_to(toll_layer)
+        tolls = get_nearby_tolls(route['route'])
+        for toll in tolls:
+            toll_icon_html = """
+                <div style="font-size: 25px; color: #ff8800;">
+                    <i class="fa-solid fa-road fa-bounce" style="color: #ff8800;"></i>
+                </div>
+            """
+            folium.Marker(
+                location=[toll['lat'], toll['lon']],
+                popup=f"Toll: {toll['name']}, Fee: {toll.get('fee', 'N/A')}",
+                tooltip="Toll",
+                icon=folium.DivIcon(html=toll_icon_html)
+            ).add_to(toll_layer)
 
-    # Add layers to the map
     toll_layer.add_to(map_obj)
     fuel_layer.add_to(map_obj)
 
-    # Add CartoDB Positron base layer with attribution
     folium.TileLayer(
         "CartoDB positron",
         name="CartoDB Positron",
@@ -310,10 +313,8 @@ def generate_map(route, start_coords, end_coords):
         control=True
     ).add_to(map_obj)
 
-    # Add LayerControl to toggle visibility
     LayerControl(collapsed=False).add_to(map_obj)
 
-    # Save the map to an HTML file
     map_path = 'static/route_map.html'
     map_obj.save(map_path)
 
