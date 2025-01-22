@@ -200,7 +200,7 @@
 
       <!-- Output Cards at the bottom -->
       <div class="output-container">
-        {% if route_data[0].distance %}
+        {% if route_data is defined and route_data %}
         <div class="output-card">
           <p class="font-bold">Distance</p>
           <p>Route 1: {{ route_data[0].distance }} km</p>
